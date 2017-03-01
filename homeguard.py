@@ -25,13 +25,12 @@ import os
 import sys
 import time
 import logging
+import smtplib
+import dropbox
 import requests
 import threading
 
 import RPi.GPIO as GPIO
-
-import dropbox
-import smtplib
 
 from picamera import PiCamera
 from requests.packages import urllib3
@@ -41,6 +40,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.image import MIMEImage
 
 
+__version__ = "1.0"
 __author__ = "Alexander Lokhman"
 __email__ = "alex.lokhman@gmail.com"
 __basename__ = os.path.splitext(__file__)[0]
@@ -96,11 +96,11 @@ _DEFAULT_ARG = object()
 
 
 class Telegram(object):
-    def __init__(self, token, users):
-        self._token = token
+    def __init__(self, token, chats):
+        assert bool(chats)
 
-        self._users = dict(u.split(":") for u in users)
-        assert self._users
+        self._token = token
+        self._chats = dict(u.split(":") for u in chats)
 
     def _get_url(self, action):
         return "https://api.telegram.org/bot%s/%s" % (self._token, action)
@@ -115,20 +115,20 @@ class Telegram(object):
         return req
 
     def send_message(self, text):
-        for chat_id, name in self._users.iteritems():
+        for chat_id, name in self._chats.iteritems():
             self._post("sendMessage", {
                 "chat_id": chat_id,
                 "text": text.format(name),
-            }, "Sending message to %s." % chat_id)
+            }, "Sending message to Telegram %s" % chat_id)
             time.sleep(1.0)
 
     def send_photo(self, path, caption=""):
-        chat_ids = self._users.keys()
+        chat_ids = self._chats.keys()
         with open(path, "rb") as f:
             req = self._post("sendPhoto", {
                 "chat_id": chat_ids[0],
                 "caption": caption,
-            }, "Sending photo to %s." % chat_ids[0], files={"photo": f})
+            }, "Sending photo to Telegram %s" % chat_ids[0], files={"photo": f})
 
         try:
             file_id = req.json()["result"]["photo"][-1]["file_id"]
@@ -140,7 +140,7 @@ class Telegram(object):
                 "chat_id": chat_id,
                 "caption": caption,
                 "photo": file_id,
-            }, "Sending photo to %s." % chat_id)
+            }, "Sending photo copy to Telegram %s" % chat_id)
 
 
 class Dropbox(object):
@@ -150,15 +150,18 @@ class Dropbox(object):
     def put_file(self, path):
         with open(path, "rb") as f:
             try:
-                self._client.put_file("/".join(path.split("/")[-3:]), f)
-                print "> Photo was saved to Dropbox."
+                rel_path = "/".join(path.split("/")[-3:])
+                self._client.put_file(rel_path, f)
+                print "> SUCCESS: Photo was saved to Dropbox at %s" % rel_path
             except dropbox.rest.ErrorResponse as e:
-                print "> FAILED to upload photo to Dropbox."
+                print "> ERROR: Photo was not saved to Dropbox"
                 sys.stderr.write(e.error_msg)
 
 
 class Mailer(object):
     def __init__(self, host, from_, to):
+        assert bool(to)
+
         self._client = smtplib.SMTP(host)
         self._from = from_
         self._to = to
@@ -175,9 +178,9 @@ class Mailer(object):
 
         r = self._client.sendmail(self._from, self._to, msg.as_string())
         if len(r) == 0:
-            print "> Email was sent to %s." % msg["To"]
+            print "> SUCCESS: Email was sent to %s" % msg["To"]
         else:
-            print "> FAILED to send email to %s." % ", ".join(r.keys())
+            print "> ERROR: Email was not sent to %s" % ", ".join(r.keys())
             sys.stderr.write(repr(r))
 
     def __del__(self):
@@ -198,8 +201,8 @@ class HomeGuard(object):
                 client = DevNull()
             else:
                 token = config.get("telegram", "token")
-                users = config.getlist("telegram", "users")
-                client = Telegram(token, users)
+                chats = config.getlist("telegram", "chats")
+                client = Telegram(token, chats)
             HomeGuard._telegram = client
         return HomeGuard._telegram
 
@@ -231,13 +234,12 @@ class HomeGuard(object):
         if HomeGuard._loaded:
             return
 
-        print "HomeGuard 1.0: Initialisation."
-
         HomeGuard._loaded = True
 
         self._channel = config.getint(ConfigParser.DEFAULT_SECTION, "channel")
         self._archive_dir = config.get(ConfigParser.DEFAULT_SECTION, "archive_dir")
 
+        print "HomeGuard %s: Initialisation" % __version__
         if not os.access(self._archive_dir, os.W_OK):
             os.mkdir(self._archive_dir)
 
@@ -247,13 +249,12 @@ class HomeGuard(object):
         if config.getboolean("beacon", "enabled"):
             try:
                 dt, dx = config.get("beacon", "delta")
+                dt = int(dt)
+
+                assert dt > 0
+                assert dx in ("m", "h", "d")
             except NoOptionError:
                 dt, dx = 1, "d"
-
-            dt = int(dt)
-
-            assert dt > 0
-            assert dx in ("m", "h", "d")
 
             kwargs = {}
             if dx == "m":
@@ -267,13 +268,12 @@ class HomeGuard(object):
                 kwargs["minute"] = int(minute)
             self._beacon(**kwargs)
 
-        print "Configuring and starting PIR Sensor."
+        print "Configuring and starting PIR sensor"
         GPIO.setup(self._channel, GPIO.IN, GPIO.PUD_DOWN)
-
         while GPIO.input(self._channel):
             pass  # waiting ready
 
-        print "Guard is enabled. Detecting motion."
+        print "Guard is enabled, detecting motion"
         self.telegram.send_message("Система успешно активирована. Счастливого пути!")
 
         while True:
@@ -281,7 +281,7 @@ class HomeGuard(object):
             self._alarm()
 
     def __del__(self):
-        print "Clean up and exit."
+        print "Clean up and exit"
         GPIO.cleanup()
 
     def _beacon(self, **kwargs):
@@ -301,7 +301,7 @@ class HomeGuard(object):
 
     def _alarm(self):
         timestamp = time.strftime("%d.%m.%Y %H:%M:%S")
-        print "ALARM: Motion detected at %s." % timestamp
+        print "ALARM: Motion detected at %s" % timestamp
 
         message = "Сработал датчик движения в %s" % timestamp
         async(self.telegram.send_message, message)
@@ -319,7 +319,7 @@ class HomeGuard(object):
                     os.makedirs(archive)
 
                 for i, path in enumerate(camera.capture_continuous(output)):
-                    print '> Photo was saved to "%s".' % path
+                    print '> Photo was saved to "%s"' % path
                     if i == 0:
                         async(self.telegram.send_photo, path)
                         async(self.mailer.send, message, path)
@@ -331,7 +331,7 @@ class HomeGuard(object):
 
                     time.sleep(delay)
 
-        print "Reporting is done. Resume motion detection."
+        print "Reporting is done, resume motion detection"
 
 if __name__ == "__main__":
     HomeGuard()
